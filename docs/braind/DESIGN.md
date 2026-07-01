@@ -280,14 +280,33 @@ Mechanics — all downstream of the single-owner rule (§2):
 - The same axum app also serves non-MCP endpoints: `GET /healthz`, `GET /metrics` (Prometheus),
   and `GET /ui` (later: tiny read-only brain browser).
 
-### 7.2 Auth
+### 7.2 MCP crate choice
+
+The Rust MCP ecosystem (mid-2026) has several viable server crates; this design standardizes on
+**`rmcp`** but is deliberately thin at the protocol boundary so the choice is swappable:
+
+| Crate | What it offers | Fit |
+|-------|----------------|-----|
+| **`rmcp`** (official, modelcontextprotocol/rust-sdk, v1.8+) | Official protocol conformance; `transport-streamable-http-server` feature; `#[tool]`/`tool_router` macros generate tool schemas from typed handler signatures; mounts into axum | **Chosen.** We already want axum for `/healthz`, `/metrics`, `/ui`; official conformance tracks protocol revisions fastest; the tool macros eliminate hand-written JSON schemas for the §9 surface |
+| `rust-mcp-sdk` | `HyperServer` (axum-based) bundling streamable HTTP + SSE, built-in transport session management, DNS-rebinding protection, `mcp_tool` derive macros | Strong alternative; its bundled server would replace some of our axum wiring. Revisit at M1 if rmcp's server ergonomics disappoint |
+| `pmcp` / `mcpkit` / `async-mcp` | Enterprise observability / protocol edge / minimalist stdio, respectively | Not needed: we bring our own tracing/metrics, and stdio-only is disqualifying (§7.1) |
+
+One clarification that holds regardless of crate: **transport-level MCP sessions are not braind
+sessions.** A streamable-HTTP session is per-connection; a braind session (§8.3) is a brain-attach
+context deliberately *shared across many connections* (a session and all its subagents). So the
+`X-Braind-Session` registry stays in our code even if the chosen crate manages transport sessions
+— the two layers compose rather than compete. All protocol handling is confined to a single
+`mcp.rs` module in the `braind` crate; tools are implemented against `brain-core` traits, so
+swapping SDKs touches one file.
+
+### 7.3 Auth
 
 Localhost-only bind by default. Clients present a bearer token from `~/.braind/token`
 (0600, generated on first start). This keeps other local users out on shared machines and is the
 hook for remote/TLS deployment later. Maintenance agents spawned by the scheduler get a scoped
 token (allowed brains + expiry) so a runaway background agent can't touch unrelated brains.
 
-### 7.3 Client configuration (Claude Code and friends)
+### 7.4 Client configuration (Claude Code and friends)
 
 ```jsonc
 // .mcp.json (project) or ~/.claude/mcp.json (user)
@@ -470,7 +489,7 @@ A tokio-based cron in `braind` (`[maintenance]` section of config) that **fast-s
 agent processes on a cadence** (requirement 9) — default runner is `claude -p "<job prompt>"
 --mcp-config <braind endpoint>` in headless mode; the runner command is configurable per job so
 any agent CLI works. Guard rails: per-job wall-clock timeout, one concurrent job per brain
-(jobs take the same write path as everyone else, so MRSW is preserved), scoped auth tokens (§7.2),
+(jobs take the same write path as everyone else, so MRSW is preserved), scoped auth tokens (§7.3),
 jitter to avoid thundering herds, and a `paused` flag per brain.
 
 ```toml
@@ -532,7 +551,7 @@ Key dependencies: `lancedb`, `arrow`, `candle-core`/`candle-transformers`/`token
 
 ### 13.2 Security & ops notes
 
-- Bind 127.0.0.1 only by default; bearer token (§7.2); 0600 perms on data dirs.
+- Bind 127.0.0.1 only by default; bearer token (§7.3); 0600 perms on data dirs.
 - Model downloads honor the host proxy; models are pinned by revision hash in config (supply-chain
   hygiene) and verified against hf-hub etags.
 - `tracing` structured logs; Prometheus `/metrics`: per-tool latency, embed queue depth, per-brain
