@@ -179,6 +179,7 @@ run, pinned by revision in config:
 
 The encoder is a **per-brain** setting recorded in `brain.toml` and the export manifest — you can
 never mix vectors from different models in one brain; import re-embeds when models differ (§11.3).
+These are the *portable* defaults — §5.4 upgrades them on the GPU host this will actually run on.
 
 ### 5.2 Embedding runtime
 
@@ -233,6 +234,37 @@ query ──► embed_query (bge-m3) ──► Lance ANN top-K (K=100, filtered:
   path — reads never take the write lock; see §6).
 
 ---
+
+### 5.4 Hardware profiles and sizing
+
+The primary deployment host has an **RTX 5090 (32 GB GDDR7)** and **32 GB system RAM**. Model
+selection and batching are a config *profile*, not a code fork — the `Embedder` trait and
+per-brain model pinning (§5.1) make profiles swappable, and import re-embeds across them.
+
+| | `cpu` profile (portable baseline) | `gpu` profile (RTX 5090 host — default there) |
+|---|---|---|
+| Candle backend | CPU | `cuda` feature, `device = "cuda:0"` |
+| Dense encoder | `BAAI/bge-m3` — 1024-dim | **`Qwen/Qwen3-Embedding-4B`** — 2560-dim, MRL-truncated to **1024** for storage (fp16 ≈ 8 GB VRAM); `-8B` (4096-dim, ≈ 16 GB) if evals justify it |
+| ColBERT reranker | `answerai-colbert-small-v1` — 96/token | **`jinaai/jina-colbert-v2`** — 128/token, 8k context, multilingual |
+| Cross-encoder final stage | off | **on** — `BAAI/bge-reranker-v2-m3` over the post-MaxSim top-16 (≈ 1.2 GB VRAM); §5.3's blend then ranks cross-encoder output |
+| Write-time micro-batch | 16 docs / 10 ms | 128 docs / 5 ms |
+| Query embed latency | tens of ms | ~1–2 ms — negligible vs. ANN + MaxSim |
+
+VRAM budget on the 5090: encoder 8–16 GB + ColBERT ~1 GB + cross-encoder ~1.2 GB leaves 14–22 GB
+headroom, so braind never needs to page models in and out — everything stays resident. Config
+still exposes `[embed] vram_budget` and `on_gpu_busy = "queue" | "cpu-fallback"` because a dev
+box GPU is shared with training runs and games; the degraded path (§13.2) already handles the
+model-unavailable extreme, this just handles the model-slow one gracefully.
+
+System RAM (32 GB) is comfortable: Lance is disk-backed with mmap'd reads (the OS page cache does
+the work), the embed service RSS is dominated by tokenizer + activations (a few GB), and journal
+replay streams. The one thing to watch is **token-vector storage**, which dominates dense vectors
+~6:1 (≈ 200 tokens × 128-dim fp16 ≈ 51 KB/record vs. 1024-dim dense fp16 at 2 KB) — token vectors
+are stored fp16, and the compact job (§12.3) is what keeps this bounded over years of accumulation.
+
+Embedding-model quality is still a moving target in 2026 (newer open-weights releases keep
+leapfrogging); the design's answer is not a bigger default but the re-embed path: pin per brain,
+benchmark challengers on the M2 eval set, and migrate brains one export/import at a time.
 
 ## 6. Consistency model
 
@@ -583,8 +615,8 @@ Key dependencies: `lancedb`, `arrow`, `candle-core`/`candle-transformers`/`token
    need the same audit treatment as knowledge (leaning: no, 30-day rolling window, not exported).
 4. **Plan-brain end-of-life** — when a plan completes, auto-synthesize its brain into the project
    brain and archive? (Leaning yes: a `plan-complete` maintenance task in v1.1.)
-5. **Cross-encoder final stage** — a third rerank stage (e.g. bge-reranker) for `think` when n is
-   small. Deferred: ColBERT should be sufficient; measure at M2.
+5. **Cross-encoder final stage** — enabled in the `gpu` profile (§5.4) since the 5090 makes it
+   nearly free; the M2 evals decide whether it earns its latency in the `cpu` profile too.
 
 ---
 
