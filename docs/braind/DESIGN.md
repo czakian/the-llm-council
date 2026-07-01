@@ -10,6 +10,15 @@ maintenance tools. Storage is **LanceDB**, retrieval is two-stage (**dense ANN �
 late-interaction reranking**), embeddings run in-process via **HuggingFace models on Candle**, and
 every mutation is journaled to auditable, portable files.
 
+**The point is not storage — it is agentic search that compounds.** Brains are federated *regions*
+of expertise (perf, build/test, prod metrics, per-project, per-plan) that compose at attach time:
+attach a set of regions and an agent instantly inherits grounded domain expertise it can search
+multi-hop (§5.5). Every use makes the system better: searches report back which records actually
+helped (reinforcement), missed queries become research assignments (deepen), project activity is
+continuously observed into episodic memory (observe), evidence is re-verified on cadence
+(re-ground), and old episodes are distilled into durable insight (synthesize). §5.5 describes this
+self-improvement flywheel end-to-end; §12 runs it in the background.
+
 ---
 
 ## 1. Goals and requirements traceability
@@ -227,7 +236,9 @@ query ──► embed_query (bge-m3) ──► Lance ANN top-K (K=100, filtered:
   it; otherwise MaxSim runs in-process over the K candidates. Either way the interface and scores
   are identical — this is an implementation detail behind `Reranker`.
 - Final score blends rerank score with record priors: `score' = maxsim_z * w1 + confidence * w2 +
-  recency_decay * w3` (weights in config; defaults 0.8/0.1/0.1).
+  recency_decay * w3 + utility * w4` (weights in config; defaults 0.7/0.1/0.1/0.1). `utility` is
+  the feedback-driven prior from §5.5 — records that repeatedly *helped* rank above records that
+  merely *match*.
 - Cross-brain queries fan out per attached brain in parallel, then merge candidates *before* the
   rerank stage so ColBERT ranks one unified pool (per-brain score normalization via z-scores).
 - Every returned record gets `access_count += 1` and a journal `access` entry (async, off the read
@@ -265,6 +276,45 @@ are stored fp16, and the compact job (§12.3) is what keeps this bounded over ye
 Embedding-model quality is still a moving target in 2026 (newer open-weights releases keep
 leapfrogging); the design's answer is not a bigger default but the re-embed path: pin per brain,
 benchmark challengers on the M2 eval set, and migrate brains one export/import at a time.
+
+### 5.5 Agentic search and the self-improvement flywheel
+
+Single-shot `think` (§5.3) is the retrieval *primitive*; **agentic search** is a loop the calling
+agent drives on top of it. The §12.1 division of labor applies to search exactly as it does to
+maintenance — the server supplies fast mechanics and honest signals, the agent supplies judgment:
+
+1. **Decompose** — the `/think` skill turns a task into several retrieval-friendly queries.
+2. **Search** — parallel `think` calls across all attached regions.
+3. **Hop** — every `think` response carries **leads**: the supersede chain around each hit,
+   neighbors sharing evidence refs or tags, related-tag clusters, and per-brain coverage stats
+   ("the plan brain had nothing above threshold for this"). Leads are what make search *agentic*
+   rather than one-shot — the agent follows them like citations in a paper.
+4. **Widen** — if coverage is weak, `suggest_brains` ranks *unattached* regions by
+   region-manifest similarity (below); the agent attaches the best candidates and re-searches.
+   This is the "compose regions to get instant domain expertise" move, available mid-task.
+5. **Synthesize** — answer from records, with citations, flagging stale/low-confidence sources.
+   Non-obvious syntheses are optionally written back via `learn` (kind `insight`, evidence =
+   `synthesized-from: [ids]`) so the next search on this topic starts warm instead of re-deriving.
+6. **Reinforce** — the agent calls `feedback` with the ids that actually contributed (and any
+   that were misleading or stale). This is the signal §5.3's `utility` prior feeds on.
+
+Each turn of the loop generates the raw material for the background half of the flywheel:
+
+| Signal from use | Captured as | Consumed by |
+|-----------------|-------------|-------------|
+| Records that helped / misled | `feedback` entries | `utility` ranking prior (§5.3); misleading/stale flags queue re-ground (§12.3) |
+| Queries with weak best-scores | query-miss log | **deepen** job researches the gap |
+| Project activity (commits, PRs, CI results) | **observe** job → `episode` records | keeps project brains abreast without anyone calling `/learn` |
+| Aging evidence | staleness scan | **re-ground** job re-verifies |
+| Episodic sprawl | topic clusters | **synthesize** job distills into insights |
+| A topic outgrowing its region | region manifests | `suggest_brains` routing; humans see it in `/brains status` |
+
+**Region manifests.** Each brain maintains a small self-description: a synthesized "what this
+region knows" summary, top topic tags, and a set of centroid embeddings over its topic clusters.
+Refreshed by the synthesize job, stored in `brain.toml` + export manifests, and embedded so
+`suggest_brains` can rank regions against a query cheaply (centroid similarity — no full search).
+Manifests are also the human catalog: `/brains list` shows *what each region is for*, and exports
+carry the manifest so a brain imported on a new host is immediately routable.
 
 ## 6. Consistency model
 
@@ -384,6 +434,10 @@ Hosts stay authoritative for data; the *repo* only carries config + exports, so 
 a new machine and attaching reconstructs the same brain topology (and `import` can seed it from
 committed exports, §11).
 
+Auto-discovery answers "what should this session attach by default"; `suggest_brains` (§5.5)
+answers "what else would help *right now*" — agents widen their attach set mid-task when region
+manifests show an unattached brain covers the topic better.
+
 ### 8.3 Session inheritance
 
 `attach_brains` returns a `session_id`. The client-side skill writes it to the environment
@@ -405,7 +459,9 @@ address records by id (brain is derivable from the id via the registry).
 | Tool | Args (essentials) | Behavior |
 |------|-------------------|----------|
 | `learn` | `title, body, kind?, tags?, evidence?, brain?, confidence?` | Embed (dense + ColBERT), journal, insert. Returns record id. Near-duplicate check first: if cosine ≥ 0.95 vs an existing record, returns `duplicate_of` instead of inserting (caller may force). |
-| `think` | `query, n?, brains?, filter? (kind/tags/min_confidence), include_stale?` | Two-stage retrieval (§5.3) across attached brains. Returns records with scores, brain attribution, evidence, and staleness flags. |
+| `think` | `query, n?, brains?, filter? (kind/tags/min_confidence), include_stale?` | Two-stage retrieval (§5.3) across attached brains. Returns records with scores, brain attribution, evidence, staleness flags, and **leads** (§5.5: supersede chains, shared-evidence/tag neighbors, per-brain coverage) for agentic hopping. |
+| `suggest_brains` | `query \| task` | Ranks *unattached* regions by manifest-centroid similarity (§5.5); returns brains with a why. The mid-task "widen" move. |
+| `feedback` | `ids, outcome: used\|misleading\|stale, note?` | Reinforcement from the searching agent (§5.5): adjusts `utility` priors; misleading/stale flags queue the record for re-ground. Journaled in the access log. |
 | `relearn` | `id, patch {title?/body?/tags?/evidence?/confidence?} \| supersede_with {new record}` | In-place patch (re-embeds if body changed) or supersede: insert new record with `supersedes: id`, mark old `superseded_by`, journal both. |
 | `forget` | `id \| filter, hard?` | Tombstone (default) — excluded from `think`, retained in Lance + journal for audit. `hard: true` deletes the row; the journal entry (with full prior record) remains the audit trail. |
 | `attach_brains` | `brains? \| auto?, cwd?, plan?` | §8. Returns `session_id`, attach set, write target. |
@@ -431,7 +487,7 @@ the tools without the skills).
 | Skill | What the skill layer adds beyond the raw tool |
 |-------|-----------------------------------------------|
 | `/learn [brain] <insight>` | Distill the conversation into a *durable* record: proper title, atomic body, evidence extraction (file refs with commit SHAs, commands with expected output, URLs), kind classification, tag suggestion. Calls `think` first to detect "we already know this" → routes to `/relearn` instead. |
-| `/think <question>` | Query formulation (expand the user's phrasing into retrieval-friendly text), call `think`, then synthesize an answer *from the returned records* with citations (`[perf:01J9Z…]`), flagging stale/low-confidence records instead of silently trusting them. |
+| `/think <question>` | Runs the agentic search loop (§5.5): decompose into queries, `think` across attached regions, hop on leads, widen via `suggest_brains` when coverage is weak, then synthesize an answer *from the returned records* with citations (`[perf:01J9Z…]`), flagging stale/low-confidence records instead of silently trusting them. Closes the loop with `feedback` on the records that mattered, and offers to `learn` non-obvious syntheses back. |
 | `/relearn <id \| description> <correction>` | Locate the target record (by id or via `think`), decide patch vs supersede (rule of thumb: meaning changed → supersede; wording/metadata → patch), update evidence, and note *why* in the journal `reason` field. |
 | `/forget <id \| description>` | Locate, confirm with the user when matched by description rather than id (destructive-ish), tombstone by default, explain that journal history is retained. |
 | `/brains [attach\|detach\|status\|list] …` | Attachment management + human-readable status. `/brains attach auto` = §8.2 discovery. |
@@ -529,6 +585,7 @@ jitter to avoid thundering herds, and a `paused` flag per brain.
 [maintenance]
 runner = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk"]
 
+[maintenance.jobs.observe]    cadence = "hourly",  brains = "active-projects"
 [maintenance.jobs.prune]      cadence = "daily",   brains = "*"
 [maintenance.jobs.dedupe]     cadence = "daily",   brains = "*"
 [maintenance.jobs.reground]   cadence = "weekly",  brains = "*"
@@ -536,10 +593,11 @@ runner = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk"]
 [maintenance.jobs.deepen]     cadence = "daily",   brains = "active-projects"  # activity-gated
 ```
 
-### 12.3 The five jobs
+### 12.3 The six jobs
 
 | Job | Candidates (server) | Judgment + apply (agent) |
 |-----|---------------------|--------------------------|
+| **observe** | Project-activity deltas since last run: git commits, merged PRs, CI/build/test outcomes, dependency bumps (raw deltas gathered by configured collectors) | Agent distills activity into `episode` records — what happened and why it matters — with evidence (commit SHAs, CI run ids) and topic tags. This is how brains keep abreast of active projects without anyone calling `/learn`; synthesize later compacts these episodes into durable insight |
 | **prune** | Score = f(age, access_count, confidence, superseded, kind) below threshold; episodes older than TTL | Agent reviews the list, spares anything still load-bearing (e.g. referenced as evidence by other records), tombstones the rest with reasons |
 | **dedupe** | Cosine-similarity clusters (≥ 0.92) among live records, per brain | Agent merges each cluster: best-of title/body, union of evidence/tags, `merge` op supersedes losers |
 | **re-ground** | Records with `last_verified_at` older than policy, ordered by access_count | Agent re-checks evidence: do the file refs still exist at those paths (at current HEAD)? do commands still produce expected output? do URLs still say what we claimed? → refresh `last_verified_at` + restore confidence, or decay confidence / `relearn` with corrections |
@@ -600,7 +658,7 @@ Key dependencies: `lancedb`, `arrow`, `candle-core`/`candle-transformers`/`token
 | **M1** | `brain-embed`: bge-m3 dense on candle, ANN search; `braind` MCP server with `learn`/`think`/`attach`/`list` | two concurrent Claude Code sessions share one brain with read-after-write |
 | **M2** | ColBERT write-time token vectors + MaxSim rerank; `relearn`/`forget`; skills plugin | rerank measurably beats dense-only on a small eval set (evals/ checked in) |
 | **M3** | Export/import (jsonl + markdown), merge semantics, project-brain auto-discovery, `.braind/` repo config | export on host A → import on host B → identical `think` results |
-| **M4** | Scheduler + all five maintenance jobs with `claude -p` runner; reports | a week of nightly runs on a real project brain produces sensible prune/dedupe/synthesize journal entries |
+| **M4** | Scheduler + all six maintenance jobs with `claude -p` runner; `feedback`/`suggest_brains` + region manifests; reports | a week of runs on a real project brain: observe keeps it current, prune/dedupe/synthesize journal entries are sensible, and `/think` measurably improves on week-old questions (flywheel evidence) |
 | **M5** | Hardening: degraded modes, metrics, scoped tokens, docs; (stretch) `braind sync` peering | — |
 
 ---
